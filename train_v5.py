@@ -41,8 +41,6 @@ CLASS_NAMES = [
 NUM_CLASSES = 7
 
 # Weights tuned to TEST distribution
-# Rocks=18%, Landscape=43%, DryGrass=17%, Sky=18%, DryBushes=3%
-# Trees=0.27%, LushBushes=0% — don't waste weight here
 CLASS_WEIGHTS = torch.tensor([
     1.0,   # Trees — rare in test, low weight
     0.5,   # Lush Bushes — absent in test, minimal weight
@@ -53,13 +51,11 @@ CLASS_WEIGHTS = torch.tensor([
     0.2,   # Sky — 18% test, already 0.98, minimal weight
 ], dtype=torch.float32)
 
-
 def remap_mask(mask):
     output = np.full(mask.shape, 255, dtype=np.uint8)
     for raw_val, class_idx in VALUE_MAP.items():
         output[mask == raw_val] = class_idx
     return output
-
 
 def get_train_transforms(size=512):
     return A.Compose([
@@ -69,7 +65,6 @@ def get_train_transforms(size=512):
             shift_limit=0.1, scale_limit=0.2,
             rotate_limit=15,
             border_mode=cv2.BORDER_REFLECT_101, p=0.5),
-        # Strong color aug — Rocks/Landscape texture variation
         A.OneOf([
             A.ColorJitter(
                 brightness=0.5, contrast=0.5,
@@ -104,7 +99,6 @@ def get_train_transforms(size=512):
         ToTensorV2()
     ])
 
-
 def get_val_transforms(size=512):
     return A.Compose([
         A.Resize(512, 512),
@@ -114,7 +108,6 @@ def get_val_transforms(size=512):
         ToTensorV2()
     ])
 
-
 class OffroadDataset(Dataset):
     def __init__(self, split_dir, is_train=True):
         self.image_dir = os.path.join(split_dir, 'Color_Images')
@@ -122,10 +115,8 @@ class OffroadDataset(Dataset):
         self.data_ids  = sorted([
             f for f in os.listdir(self.image_dir)
             if f.lower().endswith('.png')])
-        self.transform = (get_train_transforms()
-                         if is_train else get_val_transforms())
-        print(f"{'Train' if is_train else 'Val'}: "
-              f"{len(self.data_ids)} images")
+        self.transform = (get_train_transforms() if is_train else get_val_transforms())
+        print(f"{'Train' if is_train else 'Val'}: {len(self.data_ids)} images")
 
     def __len__(self):
         return len(self.data_ids)
@@ -143,6 +134,19 @@ class OffroadDataset(Dataset):
         t = self.transform(image=image, mask=mask)
         return t['image'], t['mask'].long()
 
+class FocalLoss(torch.nn.Module):
+    def __init__(self, weight=None, gamma=2.0, ignore_index=255):
+        super().__init__()
+        self.gamma = gamma
+        self.weight = weight
+        self.ignore_index = ignore_index
+        self.ce = torch.nn.CrossEntropyLoss(weight=weight, ignore_index=ignore_index, reduction='none')
+
+    def forward(self, logits, targets):
+        ce_loss = self.ce(logits, targets)
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        return focal_loss.mean()
 
 class DiceLoss(torch.nn.Module):
     def __init__(self, num_classes=7, smooth=1e-5, ignore_index=255):
@@ -156,8 +160,7 @@ class DiceLoss(torch.nn.Module):
         targets_clean = targets.clone()
         targets_clean[~valid_mask] = 0
         probs      = F.softmax(logits, dim=1)
-        targets_oh = F.one_hot(
-            targets_clean, self.num_classes).permute(0,3,1,2).float()
+        targets_oh = F.one_hot(targets_clean, self.num_classes).permute(0,3,1,2).float()
         vm         = valid_mask.unsqueeze(1).float()
         probs      = probs * vm
         targets_oh = targets_oh * vm
@@ -168,21 +171,16 @@ class DiceLoss(torch.nn.Module):
             dice_loss += 1.0-(2.*inter+self.smooth)/(union+self.smooth)
         return dice_loss / self.num_classes
 
-
 class CombinedLoss(torch.nn.Module):
     def __init__(self, class_weights, num_classes=7):
         super().__init__()
-        self.ce   = torch.nn.CrossEntropyLoss(
-            weight=class_weights, ignore_index=255)
+        self.focal = FocalLoss(weight=class_weights, gamma=2.0, ignore_index=255)
         self.dice = DiceLoss(num_classes=num_classes)
 
     def forward(self, logits, targets):
-        return 0.5*self.ce(logits, targets) + \
-               0.5*self.dice(logits, targets)
+        return 0.6 * self.focal(logits, targets) + 0.4 * self.dice(logits, targets)
 
-
-def compute_iou(preds_argmax, labels,
-                num_classes=7, ignore_index=255):
+def compute_iou(preds_argmax, labels, num_classes=7, ignore_index=255):
     preds  = preds_argmax.view(-1)
     labels = labels.view(-1)
     valid  = labels != ignore_index
@@ -195,7 +193,6 @@ def compute_iou(preds_argmax, labels,
         ious.append(float('nan') if union==0 else inter/union)
     return ious
 
-
 def compute_map(all_probs, all_labels, num_classes=7):
     aps = []
     for c in range(num_classes):
@@ -203,13 +200,11 @@ def compute_map(all_probs, all_labels, num_classes=7):
         if binary_labels.sum() == 0:
             continue
         try:
-            ap = average_precision_score(
-                binary_labels, all_probs[:,c])
+            ap = average_precision_score(binary_labels, all_probs[:,c])
             aps.append(ap)
         except Exception:
             pass
     return np.mean(aps) if aps else 0.0
-
 
 def predict_tta(model, images):
     out1 = model(pixel_values=images).logits
@@ -220,10 +215,8 @@ def predict_tta(model, images):
     out5 = model(pixel_values=torch.clamp(images*1.05,-3,3)).logits
     return (out1+out2+out3+out4+out5)/5.0
 
-
 def main():
-    device = torch.device(
-        'cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -232,17 +225,11 @@ def main():
     runs_dir   = os.path.join(script_dir, 'runs')
     os.makedirs(runs_dir, exist_ok=True)
 
-    # Datasets
     train_dataset = OffroadDataset(train_dir, is_train=True)
     val_dataset   = OffroadDataset(val_dir,   is_train=False)
-    train_loader  = DataLoader(
-        train_dataset, batch_size=2,
-        shuffle=True,  num_workers=0, pin_memory=True)
-    val_loader    = DataLoader(
-        val_dataset,   batch_size=2,
-        shuffle=False, num_workers=0, pin_memory=True)
+    train_loader  = DataLoader(train_dataset, batch_size=2, shuffle=True,  num_workers=0, pin_memory=True)
+    val_loader    = DataLoader(val_dataset,   batch_size=2, shuffle=False, num_workers=0, pin_memory=True)
 
-    # Load B4 model and resume from v4 checkpoint
     print("Loading SegFormer-B4, resuming from v4...")
     model = SegformerForSemanticSegmentation.from_pretrained(
         "nvidia/segformer-b4-finetuned-ade-512-512",
@@ -251,21 +238,14 @@ def main():
     v4_path = os.path.join(runs_dir, 'best_segformer_b4_v4.pth')
     model.load_state_dict(torch.load(v4_path, map_location=device))
     model = model.to(device)
-    print(f"Resumed from v4 checkpoint (val mIoU was 0.5968)")
+    print(f"Resumed from v4 checkpoint")
 
-    # Very low LR for fine-tuning — don't disturb learned features
-    optimizer = optim.AdamW(
-        model.parameters(), lr=5e-6, weight_decay=0.01)
-
-    # Simple cosine decay — 8 epochs
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=8, eta_min=1e-7)
-
-    criterion = CombinedLoss(
-        CLASS_WEIGHTS.to(device), NUM_CLASSES)
+    optimizer = optim.AdamW(model.parameters(), lr=5e-6, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=8, eta_min=1e-7)
+    criterion = CombinedLoss(CLASS_WEIGHTS.to(device), NUM_CLASSES)
     scaler    = GradScaler(device='cuda')
 
-    best_mIoU  = 0.5968  # start from v4 best
+    best_mIoU  = 0.5968
     no_improve = 0
     history    = []
     num_epochs = 8
@@ -275,14 +255,10 @@ def main():
     print("Focus: Rocks(18%) Landscape(43%) DryGrass(17%)\n")
 
     for epoch in range(1, num_epochs+1):
-
         # TRAIN
         model.train()
         train_loss = 0.0
-        pbar = tqdm(
-            train_loader,
-            desc=f"Ep {epoch}/{num_epochs} [Train]",
-            leave=False)
+        pbar = tqdm(train_loader, desc=f"Ep {epoch}/{num_epochs} [Train]", leave=False)
 
         for images, masks in pbar:
             images, masks = images.to(device), masks.to(device)
@@ -290,15 +266,12 @@ def main():
 
             with autocast(device_type='cuda'):
                 outputs = model(pixel_values=images).logits
-                outputs = F.interpolate(
-                    outputs, size=masks.shape[-2:],
-                    mode='bilinear', align_corners=False)
+                outputs = F.interpolate(outputs, size=masks.shape[-2:], mode='bilinear', align_corners=False)
                 loss = criterion(outputs, masks)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
@@ -316,21 +289,15 @@ def main():
         all_labels_list = []
 
         with torch.no_grad():
-            for images, masks in tqdm(
-                    val_loader,
-                    desc=f"Ep {epoch}/{num_epochs} [Val]",
-                    leave=False):
+            for images, masks in tqdm(val_loader, desc=f"Ep {epoch}/{num_epochs} [Val]", leave=False):
                 images, masks = images.to(device), masks.to(device)
                 with autocast(device_type='cuda'):
                     outputs = model(pixel_values=images).logits
-                    outputs = F.interpolate(
-                        outputs, size=masks.shape[-2:],
-                        mode='bilinear', align_corners=False)
+                    outputs = F.interpolate(outputs, size=masks.shape[-2:], mode='bilinear', align_corners=False)
                     loss = criterion(outputs, masks)
                 val_loss += loss.item()
                 preds = outputs.argmax(dim=1)
-                for c, iou in enumerate(
-                        compute_iou(preds, masks, NUM_CLASSES)):
+                for c, iou in enumerate(compute_iou(preds, masks, NUM_CLASSES)):
                     if not np.isnan(iou):
                         iou_accum[c].append(iou)
                 probs = F.softmax(outputs, dim=1)
@@ -342,111 +309,66 @@ def main():
                 all_labels_list.append(lf[vm].cpu().numpy())
 
         avg_val_loss = val_loss / len(val_loader)
-        epoch_ious   = [
-            np.mean(iou_accum[c]) if iou_accum[c]
-            else float('nan')
-            for c in range(NUM_CLASSES)]
+        epoch_ious   = [np.mean(iou_accum[c]) if iou_accum[c] else float('nan') for c in range(NUM_CLASSES)]
         mIoU = float(np.nanmean(epoch_ious))
 
         all_probs_np  = np.concatenate(all_probs_list, axis=0)
         all_labels_np = np.concatenate(all_labels_list, axis=0)
         if len(all_labels_np) > 500000:
-            idx = np.random.choice(
-                len(all_labels_np), 500000, replace=False)
+            idx = np.random.choice(len(all_labels_np), 500000, replace=False)
             all_probs_np  = all_probs_np[idx]
             all_labels_np = all_labels_np[idx]
         mAP = compute_map(all_probs_np, all_labels_np, NUM_CLASSES)
 
         print(f"\n{'='*55}")
-        print(f"EP {epoch} | Train:{avg_train_loss:.4f} | "
-              f"Val:{avg_val_loss:.4f} | "
-              f"mIoU:{mIoU:.4f} | mAP:{mAP:.4f}")
+        print(f"EP {epoch} | Train:{avg_train_loss:.4f} | Val:{avg_val_loss:.4f} | mIoU:{mIoU:.4f} | mAP:{mAP:.4f}")
         print("-"*55)
         for name, iou in zip(CLASS_NAMES, epoch_ious):
             flag = " !!" if not np.isnan(iou) and iou<0.40 else ""
             print(f"  {name:<15}: {iou:.4f}{flag}")
         print("="*55)
 
-        history.append({
-            'epoch': epoch, 'train_loss': avg_train_loss,
-            'val_loss': avg_val_loss,
-            'mIoU': mIoU, 'mAP': mAP})
-
         if mIoU > best_mIoU:
             best_mIoU  = mIoU
             no_improve = 0
-            save_path  = os.path.join(
-                runs_dir, 'best_segformer_b4_v5.pth')
+            save_path  = os.path.join(runs_dir, 'best_segformer_b4_v5.pth')
             torch.save(model.state_dict(), save_path)
-            print(f"--> Best! mIoU:{best_mIoU:.4f} "
-                  f"mAP:{mAP:.4f} saved.")
+            print(f"--> Best! mIoU:{best_mIoU:.4f} mAP:{mAP:.4f} saved.")
         else:
             no_improve += 1
-            print(f"    No improvement {no_improve}/{patience}. "
-                  f"Best:{best_mIoU:.4f}")
+            print(f"    No improvement {no_improve}/{patience}. Best:{best_mIoU:.4f}")
             if no_improve >= patience:
                 print("Early stopping.")
                 break
 
-    # FINAL TTA EVAL
     print("\nFinal TTA evaluation...")
     best_path = os.path.join(runs_dir, 'best_segformer_b4_v5.pth')
     if os.path.exists(best_path):
-        model.load_state_dict(
-            torch.load(best_path, map_location=device))
+        model.load_state_dict(torch.load(best_path, map_location=device))
         print("Loaded v5 best checkpoint")
-    else:
-        print("No improvement over v4 — v4 remains best")
 
     model.eval()
     iou_accum       = {c:[] for c in range(NUM_CLASSES)}
-    all_probs_list  = []
-    all_labels_list = []
-
+    
     with torch.no_grad():
         for images, masks in tqdm(val_loader, desc="TTA"):
             images, masks = images.to(device), masks.to(device)
             with autocast(device_type='cuda'):
                 outputs = predict_tta(model, images)
-                outputs = F.interpolate(
-                    outputs, size=masks.shape[-2:],
-                    mode='bilinear', align_corners=False)
+                outputs = F.interpolate(outputs, size=masks.shape[-2:], mode='bilinear', align_corners=False)
             preds = outputs.argmax(dim=1)
-            for c, iou in enumerate(
-                    compute_iou(preds, masks, NUM_CLASSES)):
+            for c, iou in enumerate(compute_iou(preds, masks, NUM_CLASSES)):
                 if not np.isnan(iou):
                     iou_accum[c].append(iou)
-            probs = F.softmax(outputs, dim=1)
-            B,NC,H,W = probs.shape
-            pf = probs.permute(0,2,3,1).reshape(-1,NC)
-            lf = masks.reshape(-1)
-            vm = lf != 255
-            all_probs_list.append(pf[vm].cpu().numpy())
-            all_labels_list.append(lf[vm].cpu().numpy())
-
-    final_ious = [
-        np.mean(iou_accum[c]) if iou_accum[c] else 0.0
-        for c in range(NUM_CLASSES)]
+            
+    final_ious = [np.mean(iou_accum[c]) if iou_accum[c] else 0.0 for c in range(NUM_CLASSES)]
     final_mIoU = float(np.nanmean(final_ious))
-    all_probs_np  = np.concatenate(all_probs_list, axis=0)
-    all_labels_np = np.concatenate(all_labels_list, axis=0)
-    if len(all_labels_np) > 500000:
-        idx = np.random.choice(
-            len(all_labels_np), 500000, replace=False)
-        all_probs_np  = all_probs_np[idx]
-        all_labels_np = all_labels_np[idx]
-    final_mAP = compute_map(
-        all_probs_np, all_labels_np, NUM_CLASSES)
 
     print(f"\n{'='*55}")
-    print(f"FINAL VAL (TTA) mIoU:{final_mIoU:.4f} "
-          f"mAP:{final_mAP:.4f}")
+    print(f"FINAL VAL (TTA) mIoU:{final_mIoU:.4f}")
     print("="*55)
     for name, iou in zip(CLASS_NAMES, final_ious):
         print(f"  {name:<15}: {iou:.4f}")
-
-    print(f"\nDone. Run evaluate_test_v5.py for test scores.")
-
 
 if __name__ == '__main__':
     main()

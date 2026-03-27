@@ -2,6 +2,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class FocalLoss(nn.Module):
+    def __init__(self, weight=None, gamma=2.0, ignore_index=255):
+        super().__init__()
+        self.gamma = gamma
+        self.weight = weight
+        self.ignore_index = ignore_index
+        self.ce = nn.CrossEntropyLoss(weight=weight, ignore_index=ignore_index, reduction='none')
+
+    def forward(self, logits, targets):
+        ce_loss = self.ce(logits, targets)
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        return focal_loss.mean()
 
 class MulticlassDiceLoss(nn.Module):
     """
@@ -16,20 +29,14 @@ class MulticlassDiceLoss(nn.Module):
         self.ignore_index = ignore_index
 
     def forward(self, logits, targets):
-        # Mask out ignore index pixels before anything else
-        # Replace 255 with 0 temporarily so one_hot doesn't crash
         valid_mask = targets != self.ignore_index
         targets_clean = targets.clone()
         targets_clean[~valid_mask] = 0
 
-        # Convert logits to probabilities
         probs = F.softmax(logits, dim=1)
-
-        # One-hot encode: (B, H, W) -> (B, C, H, W)
         targets_one_hot = F.one_hot(targets_clean, num_classes=self.num_classes)
         targets_one_hot = targets_one_hot.permute(0, 3, 1, 2).float()
 
-        # Zero out ignored pixels in both probs and targets
         valid_mask_expanded = valid_mask.unsqueeze(1).float()
         probs = probs * valid_mask_expanded
         targets_one_hot = targets_one_hot * valid_mask_expanded
@@ -47,30 +54,14 @@ class MulticlassDiceLoss(nn.Module):
 
         return dice_loss / self.num_classes
 
-
 class SegmentationLoss(nn.Module):
     """
-    Combined Weighted CrossEntropy + Dice Loss.
-    ce_weight and dice_weight control the balance.
-    ignore_index=255 is handled in both losses.
+    Combined Weighted Focal + Dice Loss.
     """
-    def __init__(self, class_weights, num_classes=10,
-                 ce_weight=0.6, dice_weight=0.4, ignore_index=255):
+    def __init__(self, class_weights, num_classes=10, ignore_index=255):
         super(SegmentationLoss, self).__init__()
-        self.ce_weight = ce_weight
-        self.dice_weight = dice_weight
-
-        # ignore_index=255 tells CrossEntropyLoss to skip those pixels
-        self.ce = nn.CrossEntropyLoss(
-            weight=class_weights,
-            ignore_index=ignore_index
-        )
-        self.dice = MulticlassDiceLoss(
-            num_classes=num_classes,
-            ignore_index=ignore_index
-        )
+        self.focal = FocalLoss(weight=class_weights, gamma=2.0, ignore_index=ignore_index)
+        self.dice = MulticlassDiceLoss(num_classes=num_classes, ignore_index=ignore_index)
 
     def forward(self, logits, targets):
-        ce_loss = self.ce(logits, targets)
-        dice_loss = self.dice(logits, targets)
-        return (self.ce_weight * ce_loss) + (self.dice_weight * dice_loss)
+        return 0.6 * self.focal(logits, targets) + 0.4 * self.dice(logits, targets)
